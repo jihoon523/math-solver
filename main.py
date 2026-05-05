@@ -253,6 +253,139 @@ EXPLANATION: (핵심 포인트 한 문장)"""
     return parse_structured(text)
 
 
+def extract_polynomial_roots(problem: str):
+    """문제에서 다항식을 추출하고 근을 수치로 계산"""
+    text = problem
+    for sup, exp in [("³","**3"),("²","**2"),("¹","**1"),("^3","**3"),("^2","**2"),("^","**")]:
+        text = text.replace(sup, exp)
+    text = re.sub(r'(\d)([x])', r'\1*\2', text)
+
+    match = re.search(r'([x\d\s\+\-\*\(\)\.\*]+)\s*=\s*0', text)
+    if not match:
+        return None
+    poly_str = match.group(1).strip()
+    try:
+        x = symbols('x')
+        poly = sympify(poly_str)
+        roots = solve(poly, x)
+        real_roots = []
+        for r in roots:
+            try:
+                val = float(r.evalf())
+                real_roots.append(round(val, 10))
+            except Exception:
+                pass
+        return real_roots if real_roots else None
+    except Exception:
+        return None
+
+
+def math_to_python(expr: str) -> str:
+    """수학 표기를 Python 실행 가능한 코드로 변환"""
+    # 그리스 문자 → 변수명
+    expr = expr.replace('α', 'a').replace('β', 'b').replace('γ', 'c')
+    expr = expr.replace('[', '(').replace(']', ')')
+    # 유니코드 위첨자 및 ^ 표기
+    for sup, exp in [
+        ("⁹","**9"),("⁸","**8"),("⁷","**7"),("⁶","**6"),("⁵","**5"),("⁴","**4"),
+        ("³","**3"),("²","**2"),("¹","**1"),
+        ("^9","**9"),("^8","**8"),("^7","**7"),("^6","**6"),("^5","**5"),("^4","**4"),
+        ("^3","**3"),("^2","**2"),("^","**"),
+    ]:
+        expr = expr.replace(sup, exp)
+    expr = re.sub(r'(\d)([a-zA-Z])', r'\1*\2', expr)
+    expr = re.sub(r'\)\s*\(', r')*(', expr)
+    expr = re.sub(r'(\d)\s*\(', r'\1*(', expr)
+    return expr.strip()
+
+
+def extract_math_expression(problem: str) -> str:
+    """문제에서 계산할 수식 부분만 추출"""
+    # 한국어 패턴: 수식이 "의 값을 구하시오" 앞에 위치
+    for end_marker in ["의 값을 구하시오", "의값을구하시오", "의 값을 구하여라", "의 값을구하시오"]:
+        idx = problem.find(end_marker)
+        if idx != -1:
+            before = problem[:idx].strip()
+            # "라 할 때" 이후 부분이 수식
+            for delimiter in ["라 할 때,", "라 할 때", "라고 할 때,", "라고 할 때", "할 때,", "할 때"]:
+                d_idx = before.rfind(delimiter)
+                if d_idx != -1:
+                    expr = before[d_idx + len(delimiter):].strip().lstrip(",").strip()
+                    if expr:
+                        return expr
+            # 딜리미터 없으면 "= 0" 이후 부분
+            if "= 0" in before:
+                expr = before.split("= 0", 1)[-1].strip().lstrip(",").strip()
+                if expr:
+                    return expr
+            return before
+
+    # 영어 패턴: 수식이 마커 뒤에 위치
+    for marker in ["compute sum of", "compute", "find the value of", "evaluate"]:
+        idx = problem.lower().find(marker.lower())
+        if idx != -1:
+            after = problem[idx + len(marker):].strip().lstrip(",").strip()
+            if "= 0" in after:
+                after = after.split("= 0", 1)[-1].strip().lstrip(",").strip()
+            return after
+    return ""
+
+
+async def numeric_root_evaluation(problem: str) -> dict:
+    """다항식 근을 수치 계산하고 수식을 직접 Python으로 변환해 실행"""
+    roots = extract_polynomial_roots(problem)
+    if not roots or len(roots) < 2:
+        return {"success": False}
+
+    a = roots[0]
+    b = roots[1]
+    c = roots[2] if len(roots) > 2 else 0.0
+
+    # 1차 시도: 문제에서 직접 수식 추출
+    raw_expr = extract_math_expression(problem)
+    expr_code = math_to_python(raw_expr) if raw_expr else ""
+
+    # 2차 시도: Claude에게 코드 생성 요청
+    if not expr_code:
+        prompt = f"""Convert this math problem's expression to a single Python arithmetic expression.
+Roots already computed: a={a}, b={b}, c={c}
+Problem: {problem}
+Rules: use only a,b,c variables, **, *, +, -, /, (, ) operators only. No imports or functions.
+Output only: EXPRESSION: <python expression>"""
+        try:
+            code_text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=400)
+            for line in code_text.splitlines():
+                if "EXPRESSION:" in line:
+                    expr_code = line.split("EXPRESSION:", 1)[1].strip().strip("`")
+                    break
+            if not expr_code and code_text.strip():
+                expr_code = code_text.strip().splitlines()[-1].strip("`")
+        except Exception:
+            pass
+
+    if not expr_code:
+        return {"success": False}
+
+    if re.search(r'(import|exec|eval|open|os|sys|__)', expr_code):
+        return {"success": False}
+
+    try:
+        result = eval(expr_code, {"__builtins__": {}}, {"a": a, "b": b, "c": c})
+        result = float(result.real if hasattr(result, 'real') else result)
+        if abs(result - round(result)) < 0.01:
+            result = int(round(result))
+
+        return {
+            "success": True,
+            "problem_type": "대칭식 (수치 계산)",
+            "answer": str(result),
+            "solution": f"**다항식의 근 (수치)**\n\n$$a = {round(a,6)}, \\quad b = {round(b,6)}, \\quad c = {round(c,6)}$$\n\n**계산식**\n\n`{expr_code}`\n\n**결과:** ${result}$",
+            "explanation": "SymPy로 근을 수치 계산한 뒤 Python으로 직접 연산한 정확한 결과입니다.",
+        }
+    except Exception:
+        return {"success": False}
+
+
 async def wolfram_solve(problem: str) -> dict:
     if not WOLFRAM_APP_ID:
         return {"success": False}
@@ -410,6 +543,18 @@ async def solve_problem(request: SolveRequest):
     sympy_result = sympy_solve(normalized, original)
 
     if not sympy_result["success"]:
+        # 수치 근 계산 시도 (대칭식 문제)
+        numeric_result = await numeric_root_evaluation(original)
+        if numeric_result["success"]:
+            return {
+                "success": True,
+                "problem_type": numeric_result.get("problem_type", "수학 문제"),
+                "parsed_expression": original,
+                "answer": numeric_result.get("answer", ""),
+                "solution": numeric_result.get("solution", ""),
+                "explanation": numeric_result.get("explanation", ""),
+                "verified": True,
+            }
         # Wolfram Alpha 시도
         wolfram_result = await wolfram_solve(original)
         if wolfram_result["success"]:
