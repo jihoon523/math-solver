@@ -282,6 +282,8 @@ def extract_polynomial_roots(problem: str):
 
 def math_to_python(expr: str) -> str:
     """수학 표기를 Python 실행 가능한 코드로 변환"""
+    # 개행 제거 (멀티라인 수식 처리)
+    expr = expr.replace('\n', ' ').replace('\r', ' ')
     # 그리스 문자 → 변수명
     expr = expr.replace('α', 'a').replace('β', 'b').replace('γ', 'c')
     expr = expr.replace('[', '(').replace(']', ')')
@@ -367,7 +369,10 @@ Output only: EXPRESSION: <python expression>"""
             pass
 
     if not expr_code:
+        print(f"[DEBUG] expr_code 추출 실패. raw_expr={repr(raw_expr)}")
         return {"success": False}
+
+    print(f"[DEBUG] expr_code={repr(expr_code[:200])}")
 
     if re.search(r'(import|exec|eval|open|os|sys|__)', expr_code):
         return {"success": False}
