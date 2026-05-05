@@ -206,7 +206,7 @@ def sympy_solve(problem: str, original: str) -> dict:
         return {"success": False, "error": f"계산 오류: {str(e)}"}
 
 
-async def _call_claude(messages: list, max_tokens: int = 1200) -> str:
+async def _call_claude(messages: list, max_tokens: int = 1200, timeout: int = 60) -> str:
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -216,7 +216,7 @@ async def _call_claude(messages: list, max_tokens: int = 1200) -> str:
                 "content-type": "application/json",
             },
             json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "messages": messages},
-            timeout=30,
+            timeout=timeout,
         )
         resp.raise_for_status()
         return resp.json()["content"][0]["text"].strip()
@@ -388,6 +388,7 @@ Output only: EXPRESSION: <python expression>"""
             r2 = eval(expr_code, safe_ns, {"a": b, "b": c, "c": a})
             r3 = eval(expr_code, safe_ns, {"a": c, "b": a, "c": b})
             result = float(r1) + float(r2) + float(r3)
+            display_total = int(round(result)) if abs(result - round(result)) < 0.001 else round(result, 6)
             solution_body = (
                 f"**세 근 (수치 계산)**\n\n"
                 f"$$\\alpha = {round(a,6)}, \\quad \\beta = {round(b,6)}, \\quad \\gamma = {round(c,6)}$$\n\n"
@@ -396,10 +397,17 @@ Output only: EXPRESSION: <python expression>"""
                 f"- $f(\\alpha, \\beta, \\gamma) = {round(float(r1), 6)}$\n"
                 f"- $f(\\beta, \\gamma, \\alpha) = {round(float(r2), 6)}$\n"
                 f"- $f(\\gamma, \\alpha, \\beta) = {round(float(r3), 6)}$\n\n"
-                f"**합계:** ${round(float(r1),6)} + ({round(float(r2),6)}) + {round(float(r3),6)} = {result}$"
+                f"**합계:** ${round(float(r1),6)} + ({round(float(r2),6)}) + {round(float(r3),6)} = {display_total}$"
             )
         else:
             result = float(eval(expr_code, safe_ns, {"a": a, "b": b, "c": c}))
+
+        if abs(result - round(result)) < 0.001:
+            result = int(round(result))
+
+        if is_cyclic:
+            pass  # solution_body already set above
+        else:
             solution_body = (
                 f"**세 근 (수치 계산)**\n\n"
                 f"$$\\alpha = {round(a,6)}, \\quad \\beta = {round(b,6)}, \\quad \\gamma = {round(c,6)}$$\n\n"
@@ -407,9 +415,6 @@ Output only: EXPRESSION: <python expression>"""
                 f"$\\alpha, \\beta, \\gamma$ 값을 수식에 대입하여 직접 계산합니다.\n\n"
                 f"**결과:** ${result}$"
             )
-
-        if abs(result - round(result)) < 0.001:
-            result = int(round(result))
 
         return {
             "success": True,
@@ -443,11 +448,12 @@ SOLUTION:
 EXPLANATION: (이 문제의 핵심 수학적 아이디어 한 문장)"""
 
     try:
-        text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=2500)
+        text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=2500, timeout=90)
         parsed = parse_structured(text)
         parsed["success"] = True
         return parsed
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG] claude_explain_with_answer 실패: {e}")
         return {"success": False}
 
 
