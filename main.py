@@ -388,10 +388,25 @@ Output only: EXPRESSION: <python expression>"""
             r2 = eval(expr_code, safe_ns, {"a": b, "b": c, "c": a})
             r3 = eval(expr_code, safe_ns, {"a": c, "b": a, "c": b})
             result = float(r1) + float(r2) + float(r3)
-            calc_note = f"순환합 = f(a,b,c) + f(b,c,a) + f(c,a,b)\n= {round(float(r1),6)} + {round(float(r2),6)} + {round(float(r3),6)}"
+            solution_body = (
+                f"**세 근 (수치 계산)**\n\n"
+                f"$$\\alpha = {round(a,6)}, \\quad \\beta = {round(b,6)}, \\quad \\gamma = {round(c,6)}$$\n\n"
+                f"**순환합 계산**\n\n"
+                f"각 근을 대입한 세 항의 값:\n\n"
+                f"- $f(\\alpha, \\beta, \\gamma) = {round(float(r1), 6)}$\n"
+                f"- $f(\\beta, \\gamma, \\alpha) = {round(float(r2), 6)}$\n"
+                f"- $f(\\gamma, \\alpha, \\beta) = {round(float(r3), 6)}$\n\n"
+                f"**합계:** ${round(float(r1),6)} + ({round(float(r2),6)}) + {round(float(r3),6)} = {result}$"
+            )
         else:
             result = float(eval(expr_code, safe_ns, {"a": a, "b": b, "c": c}))
-            calc_note = f"계산식: `{expr_code}`"
+            solution_body = (
+                f"**세 근 (수치 계산)**\n\n"
+                f"$$\\alpha = {round(a,6)}, \\quad \\beta = {round(b,6)}, \\quad \\gamma = {round(c,6)}$$\n\n"
+                f"**각 근 대입 계산**\n\n"
+                f"$\\alpha, \\beta, \\gamma$ 값을 수식에 대입하여 직접 계산합니다.\n\n"
+                f"**결과:** ${result}$"
+            )
 
         if abs(result - round(result)) < 0.001:
             result = int(round(result))
@@ -400,15 +415,38 @@ Output only: EXPRESSION: <python expression>"""
             "success": True,
             "problem_type": "대칭식 (수치 계산)",
             "answer": str(result),
-            "solution": (
-                f"**다항식의 근 (수치)**\n\n"
-                f"$$a = {round(a,6)}, \\quad b = {round(b,6)}, \\quad c = {round(c,6)}$$\n\n"
-                f"**각 항의 수식**\n\n`{expr_code}`\n\n"
-                f"**{calc_note}**\n\n"
-                f"**결과:** ${result}$"
-            ),
+            "solution": solution_body,
             "explanation": "SymPy로 근을 수치 계산한 뒤 Python으로 직접 연산한 정확한 결과입니다.",
         }
+    except Exception:
+        return {"success": False}
+
+
+async def claude_explain_with_answer(problem: str, answer: str) -> dict:
+    """수치 계산으로 검증된 정답을 바탕으로 Claude에게 수학적 풀이 설명 요청"""
+    if not CLAUDE_API_KEY:
+        return {"success": False}
+
+    prompt = f"""다음 수학 문제의 정확한 정답은 {answer}입니다. (수치 계산으로 이미 검증됨)
+
+문제: {problem}
+
+정답이 {answer}임을 전제로, 이 결과가 나오는 수학적 풀이를 단계별로 설명해주세요.
+미분, 부분분수 분해, 극한, 근과 계수의 관계 등 고급 기법을 활용해 우아하게 풀어주세요.
+
+아래 형식으로 정확히 답하세요:
+
+PROBLEM_TYPE: (문제 유형)
+ANSWER: {answer}
+SOLUTION:
+(마크다운 형식의 단계별 풀이. 수식은 인라인 $...$, 블록 $$...$$로 표시. 각 단계는 **굵게** 소제목. 최소 3단계)
+EXPLANATION: (이 문제의 핵심 수학적 아이디어 한 문장)"""
+
+    try:
+        text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=2500)
+        parsed = parse_structured(text)
+        parsed["success"] = True
+        return parsed
     except Exception:
         return {"success": False}
 
@@ -573,13 +611,16 @@ async def solve_problem(request: SolveRequest):
         # 수치 근 계산 시도 (대칭식 문제)
         numeric_result = await numeric_root_evaluation(original)
         if numeric_result["success"]:
+            verified_answer = numeric_result.get("answer", "")
+            # 정답을 알고 있으므로 Claude에게 수학적 풀이 설명 요청
+            explain_result = await claude_explain_with_answer(original, verified_answer)
             return {
                 "success": True,
-                "problem_type": numeric_result.get("problem_type", "수학 문제"),
+                "problem_type": explain_result.get("problem_type", numeric_result.get("problem_type", "수학 문제")),
                 "parsed_expression": original,
-                "answer": numeric_result.get("answer", ""),
-                "solution": numeric_result.get("solution", ""),
-                "explanation": numeric_result.get("explanation", ""),
+                "answer": verified_answer,
+                "solution": explain_result.get("solution", numeric_result.get("solution", "")),
+                "explanation": explain_result.get("explanation", numeric_result.get("explanation", "")),
                 "verified": True,
             }
         # Wolfram Alpha 시도
