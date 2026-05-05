@@ -448,7 +448,7 @@ SOLUTION:
 EXPLANATION: (이 문제의 핵심 수학적 아이디어 한 문장)"""
 
     try:
-        text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=2500, timeout=90)
+        text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=4096, timeout=120)
         parsed = parse_structured(text)
         parsed["success"] = True
         return parsed
