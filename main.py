@@ -369,17 +369,36 @@ Output only: EXPRESSION: <python expression>"""
     if re.search(r'(import|exec|eval|open|os|sys|__)', expr_code):
         return {"success": False}
 
+    # 순환합 여부 판단 ("sum of" 또는 "∑" 포함 시)
+    is_cyclic = "sum of" in problem.lower() or "∑" in problem or "순환합" in problem
+
     try:
-        result = eval(expr_code, {"__builtins__": {}}, {"a": a, "b": b, "c": c})
-        result = float(result.real if hasattr(result, 'real') else result)
-        if abs(result - round(result)) < 0.01:
+        safe_ns = {"__builtins__": {}}
+        if is_cyclic:
+            # 순환합: f(a,b,c) + f(b,c,a) + f(c,a,b)
+            r1 = eval(expr_code, safe_ns, {"a": a, "b": b, "c": c})
+            r2 = eval(expr_code, safe_ns, {"a": b, "b": c, "c": a})
+            r3 = eval(expr_code, safe_ns, {"a": c, "b": a, "c": b})
+            result = float(r1) + float(r2) + float(r3)
+            calc_note = f"순환합 = f(a,b,c) + f(b,c,a) + f(c,a,b)\n= {round(float(r1),6)} + {round(float(r2),6)} + {round(float(r3),6)}"
+        else:
+            result = float(eval(expr_code, safe_ns, {"a": a, "b": b, "c": c}))
+            calc_note = f"계산식: `{expr_code}`"
+
+        if abs(result - round(result)) < 0.001:
             result = int(round(result))
 
         return {
             "success": True,
             "problem_type": "대칭식 (수치 계산)",
             "answer": str(result),
-            "solution": f"**다항식의 근 (수치)**\n\n$$a = {round(a,6)}, \\quad b = {round(b,6)}, \\quad c = {round(c,6)}$$\n\n**계산식**\n\n`{expr_code}`\n\n**결과:** ${result}$",
+            "solution": (
+                f"**다항식의 근 (수치)**\n\n"
+                f"$$a = {round(a,6)}, \\quad b = {round(b,6)}, \\quad c = {round(c,6)}$$\n\n"
+                f"**각 항의 수식**\n\n`{expr_code}`\n\n"
+                f"**{calc_note}**\n\n"
+                f"**결과:** ${result}$"
+            ),
             "explanation": "SymPy로 근을 수치 계산한 뒤 Python으로 직접 연산한 정확한 결과입니다.",
         }
     except Exception:
