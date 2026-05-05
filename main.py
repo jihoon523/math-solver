@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sympy import (
@@ -9,7 +9,12 @@ import re
 import os
 import httpx
 import base64
+import sqlite3
+import datetime
+from typing import Optional
 from dotenv import load_dotenv
+import jwt
+from passlib.context import CryptContext
 
 load_dotenv()
 
@@ -26,12 +31,83 @@ app.add_middleware(
 CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_INPUT_LENGTH = 2000
+SECRET_KEY = os.environ.get("SECRET_KEY", "mathsolver-secret-key-2024")
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+DB_PATH = "users.db"
 
 
+# ── 데이터베이스 초기화 ─────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            problem TEXT NOT NULL,
+            problem_type TEXT,
+            answer TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def create_token(user_id: int, username: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "username": username,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload
+    except Exception:
+        return None
+
+
+# ── 요청 모델 ────────────────────────────────────────────────
 class SolveRequest(BaseModel):
     problem: str
 
 
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+class SaveHistoryRequest(BaseModel):
+    problem: str
+    problem_type: str
+    answer: str
+
+
+# ── 텍스트 파싱 ──────────────────────────────────────────────
 def parse_structured(text: str) -> dict:
     def extract(label, content):
         m = re.search(rf"{label}:\s*(.+?)(?=\n[A-Z_]+:|$)", content, re.DOTALL)
@@ -47,7 +123,6 @@ def parse_structured(text: str) -> dict:
 
 
 def detect_variable(problem: str):
-    """문제에서 주요 변수 감지 (x, y, z, t, n 순)"""
     for v in ["x", "y", "z", "t", "n", "k"]:
         if re.search(rf'\b{v}\b', problem):
             return symbols(v)
@@ -198,6 +273,75 @@ EXPLANATION: (이 문제의 핵심 포인트 한 문장)"""
     return {"success": True, **parsed}
 
 
+# ── 인증 엔드포인트 ──────────────────────────────────────────
+@app.post("/register")
+async def register(request: AuthRequest):
+    if len(request.username) < 3:
+        return {"success": False, "error": "아이디는 3자 이상이어야 합니다."}
+    if len(request.password) < 6:
+        return {"success": False, "error": "비밀번호는 6자 이상이어야 합니다."}
+    conn = get_db()
+    try:
+        password_hash = pwd_context.hash(request.password)
+        conn.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (request.username, password_hash)
+        )
+        conn.commit()
+        user = conn.execute("SELECT id FROM users WHERE username = ?", (request.username,)).fetchone()
+        token = create_token(user["id"], request.username)
+        return {"success": True, "token": token, "username": request.username}
+    except sqlite3.IntegrityError:
+        return {"success": False, "error": "이미 사용 중인 아이디입니다."}
+    finally:
+        conn.close()
+
+
+@app.post("/login")
+async def login(request: AuthRequest):
+    conn = get_db()
+    try:
+        user = conn.execute("SELECT * FROM users WHERE username = ?", (request.username,)).fetchone()
+        if not user or not pwd_context.verify(request.password, user["password_hash"]):
+            return {"success": False, "error": "아이디 또는 비밀번호가 틀렸습니다."}
+        token = create_token(user["id"], request.username)
+        return {"success": True, "token": token, "username": request.username}
+    finally:
+        conn.close()
+
+
+@app.get("/history")
+async def get_history(user=Depends(get_current_user)):
+    if not user:
+        return {"success": False, "error": "로그인이 필요합니다."}
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, problem, problem_type, answer, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+            (user["user_id"],)
+        ).fetchall()
+        return {"success": True, "history": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/history/save")
+async def save_history_endpoint(request: SaveHistoryRequest, user=Depends(get_current_user)):
+    if not user:
+        return {"success": False}
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO history (user_id, problem, problem_type, answer) VALUES (?, ?, ?, ?)",
+            (user["user_id"], request.problem, request.problem_type, request.answer)
+        )
+        conn.commit()
+        return {"success": True}
+    finally:
+        conn.close()
+
+
+# ── 기존 엔드포인트 ──────────────────────────────────────────
 @app.post("/solve")
 async def solve_problem(request: SolveRequest):
     original = request.problem.strip()
