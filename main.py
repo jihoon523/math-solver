@@ -1,0 +1,315 @@
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sympy import (
+    symbols, Eq, solve, sympify, diff, integrate,
+    factor, expand, simplify
+)
+import re
+import os
+import httpx
+import base64
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = "claude-sonnet-4-6"
+MAX_INPUT_LENGTH = 2000
+
+
+class SolveRequest(BaseModel):
+    problem: str
+
+
+def parse_structured(text: str) -> dict:
+    def extract(label, content):
+        m = re.search(rf"{label}:\s*(.+?)(?=\n[A-Z_]+:|$)", content, re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    solution_m = re.search(r"SOLUTION:\s*\n(.*?)(?=\nEXPLANATION:|$)", text, re.DOTALL)
+    return {
+        "problem_type": extract("PROBLEM_TYPE", text),
+        "answer":        extract("ANSWER", text),
+        "solution":      solution_m.group(1).strip() if solution_m else text,
+        "explanation":   extract("EXPLANATION", text),
+    }
+
+
+def detect_variable(problem: str):
+    """문제에서 주요 변수 감지 (x, y, z, t, n 순)"""
+    for v in ["x", "y", "z", "t", "n", "k"]:
+        if re.search(rf'\b{v}\b', problem):
+            return symbols(v)
+    return symbols("x")
+
+
+def normalize(problem: str) -> str:
+    remove_words = [
+        "을 풀어줘", "를 풀어줘", "풀어줘", "풀어라", "풀어",
+        "구해줘", "구해라", "구해", "해결해줘", "계산해줘",
+        "미분해줘", "미분해", "적분해줘", "적분해",
+        "인수분해해줘", "인수분해해", "인수분해",
+        "전개해줘", "전개해", "단순화해줘",
+    ]
+    for word in remove_words:
+        problem = problem.replace(word, "")
+    problem = problem.strip()
+    problem = problem.replace(" ", "").replace("^", "**")
+    problem = re.sub(r"(\d)([a-zA-Z])", r"\1*\2", problem)
+    problem = re.sub(r"(\))(\()", r"\1*\2", problem)
+    problem = re.sub(r"(\d)(\()", r"\1*\2", problem)
+    problem = re.sub(r"(\))(\d)", r"\1*\2", problem)
+    return problem
+
+
+def detect_mode(original: str) -> str:
+    if any(k in original for k in ["미분", "diff", "d/dx"]):
+        return "diff"
+    if any(k in original for k in ["적분", "integrate", "∫"]):
+        return "integrate"
+    if any(k in original for k in ["인수분해", "factor"]):
+        return "factor"
+    if any(k in original for k in ["전개", "expand"]):
+        return "expand"
+    if "=" in original:
+        return "equation"
+    return "simplify"
+
+
+def sympy_solve(problem: str, original: str) -> dict:
+    var = detect_variable(original)
+    var_name = str(var)
+    mode = detect_mode(original)
+
+    try:
+        if mode == "equation":
+            left, right = problem.split("=", 1)
+            eq = Eq(sympify(left), sympify(right))
+            solution = solve(eq, var)
+            if not solution:
+                return {"success": False, "error": "SymPy가 해를 찾지 못했습니다."}
+            answers = [f"{var_name} = {s}" for s in solution]
+            return {
+                "success": True, "mode": "equation",
+                "parsed": str(eq), "answer": ", ".join(answers),
+            }
+        elif mode == "diff":
+            expr = sympify(problem)
+            result = diff(expr, var)
+            return {"success": True, "mode": "diff", "parsed": str(expr), "answer": str(result)}
+        elif mode == "integrate":
+            expr = sympify(problem)
+            result = integrate(expr, var)
+            return {"success": True, "mode": "integrate", "parsed": str(expr), "answer": str(result) + " + C"}
+        elif mode == "factor":
+            expr = sympify(problem)
+            result = factor(expr)
+            return {"success": True, "mode": "factor", "parsed": str(expr), "answer": str(result)}
+        elif mode == "expand":
+            expr = sympify(problem)
+            result = expand(expr)
+            return {"success": True, "mode": "expand", "parsed": str(expr), "answer": str(result)}
+        else:
+            expr = sympify(problem)
+            result = simplify(expr)
+            if str(result) == str(expr):
+                return {"success": False, "error": "SymPy로 단순화할 수 없습니다."}
+            return {"success": True, "mode": "simplify", "parsed": str(expr), "answer": str(result)}
+    except Exception as e:
+        return {"success": False, "error": f"계산 오류: {str(e)}"}
+
+
+async def _call_claude(messages: list, max_tokens: int = 1200) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "messages": messages},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"].strip()
+
+
+async def claude_explain(original_problem: str, sympy_result: dict) -> dict:
+    mode_labels = {
+        "equation": "방정식", "diff": "미분", "integrate": "부정적분",
+        "factor": "인수분해", "expand": "전개", "simplify": "단순화",
+    }
+    if not CLAUDE_API_KEY:
+        return {
+            "problem_type": mode_labels.get(sympy_result.get("mode", ""), "수식"),
+            "solution": f"**풀이**\n\n입력된 식: ${sympy_result['parsed']}$\n\n**결과:** ${sympy_result['answer']}$",
+            "answer": sympy_result["answer"],
+            "explanation": "Claude API 키가 설정되지 않아 기본 풀이만 제공됩니다.",
+        }
+
+    prompt = f"""다음 수학 문제와 계산 결과를 바탕으로 중학생도 이해할 수 있게 단계별로 설명해주세요.
+
+원본 문제: {original_problem}
+계산 결과: {sympy_result['answer']}
+계산 모드: {sympy_result['mode']}
+
+아래 형식으로 정확히 답하세요:
+
+PROBLEM_TYPE: (문제 유형, 예: 일차방정식)
+ANSWER: (최종 정답)
+SOLUTION:
+(마크다운 형식으로 단계별 풀이. 수식은 인라인 $...$, 블록 $$...$$로 표시. 각 단계는 **굵게** 소제목 사용. 최소 4단계)
+EXPLANATION: (핵심 포인트 한 문장)"""
+
+    text = await _call_claude([{"role": "user", "content": prompt}])
+    return parse_structured(text)
+
+
+async def claude_solve_directly(problem: str) -> dict:
+    if not CLAUDE_API_KEY:
+        return {"success": False, "error": "Claude API 키가 설정되지 않았습니다."}
+
+    prompt = f"""다음 수학 문제를 중학생도 이해할 수 있도록 쉽고 친절하게 단계별로 풀어주세요.
+
+문제: {problem}
+
+아래 형식으로 정확히 답하세요:
+
+PROBLEM_TYPE: (문제 유형, 예: 수열, 함수, 확률 등)
+ANSWER: (최종 정답)
+SOLUTION:
+(마크다운 형식으로 단계별 풀이. 수식은 인라인 $...$, 블록 $$...$$로 표시. 각 단계는 **굵게** 소제목으로 구분. 구체적인 숫자 계산 포함. 최소 5단계)
+EXPLANATION: (이 문제의 핵심 포인트 한 문장)"""
+
+    text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=1500)
+    parsed = parse_structured(text)
+    return {"success": True, **parsed}
+
+
+@app.post("/solve")
+async def solve_problem(request: SolveRequest):
+    original = request.problem.strip()
+
+    if not original:
+        return {"success": False, "error": "문제를 입력해주세요."}
+    if len(original) > MAX_INPUT_LENGTH:
+        return {"success": False, "error": f"입력이 너무 깁니다. (최대 {MAX_INPUT_LENGTH}자)"}
+
+    normalized = normalize(original)
+    sympy_result = sympy_solve(normalized, original)
+
+    if not sympy_result["success"]:
+        try:
+            result = await claude_solve_directly(original)
+            if result["success"]:
+                return {
+                    "success": True,
+                    "problem_type": result.get("problem_type", "수학 문제"),
+                    "parsed_expression": original,
+                    "answer": result.get("answer", ""),
+                    "solution": result.get("solution", ""),
+                    "explanation": result.get("explanation", ""),
+                    "verified": True,
+                }
+        except Exception:
+            pass
+        return {"success": False, "error": sympy_result["error"]}
+
+    try:
+        claude_result = await claude_explain(original, sympy_result)
+    except Exception as e:
+        claude_result = {
+            "problem_type": sympy_result.get("mode", "계산"),
+            "solution": f"**결과:** {sympy_result['answer']}",
+            "answer": sympy_result["answer"],
+            "explanation": f"Claude 설명 오류: {str(e)}",
+        }
+
+    return {
+        "success": True,
+        "problem_type": claude_result.get("problem_type", sympy_result["mode"]),
+        "parsed_expression": sympy_result["parsed"],
+        "answer": claude_result.get("answer", sympy_result["answer"]),
+        "solution": claude_result.get("solution", ""),
+        "explanation": claude_result.get("explanation", ""),
+        "verified": True,
+    }
+
+
+@app.post("/hint")
+async def get_hint(request: SolveRequest):
+    problem = request.problem.strip()
+    if not problem:
+        return {"success": False, "hint": "문제를 먼저 입력해주세요."}
+    if not CLAUDE_API_KEY:
+        return {"success": False, "hint": "힌트를 생성하려면 Claude API 키가 필요합니다."}
+
+    prompt = f"""다음 수학 문제에 대한 힌트를 하나만 제공해주세요.
+정답은 절대 말하지 말고, 풀이 방향만 살짝 알려주세요. 두 문장 이내로 간결하게.
+
+문제: {problem}
+
+힌트:"""
+
+    try:
+        text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=200)
+        return {"success": True, "hint": text}
+    except Exception as e:
+        return {"success": False, "hint": f"힌트 생성 오류: {str(e)}"}
+
+
+@app.post("/extract-pdf")
+async def extract_pdf(file: UploadFile = File(...)):
+    if file.content_type != "application/pdf":
+        return {"success": False, "error": "PDF 파일만 지원합니다."}
+    if not CLAUDE_API_KEY:
+        return {"success": False, "error": "PDF 인식을 위해 ANTHROPIC_API_KEY 환경변수를 설정해주세요."}
+
+    try:
+        pdf_bytes = await file.read()
+        b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+        text = await _call_claude([{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
+                {"type": "text", "text": "이 PDF에 있는 수학 문제를 텍스트로만 추출해주세요. 수식 기호는 그대로 유지하고, 문제 텍스트만 출력하세요. 설명 없이 문제만 출력하세요."}
+            ],
+        }], max_tokens=500)
+        return {"success": True, "problem": text}
+    except Exception as e:
+        return {"success": False, "error": f"PDF 처리 오류: {str(e)}"}
+
+
+@app.post("/extract-image")
+async def extract_image(file: UploadFile = File(...)):
+    allowed = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+    if file.content_type not in allowed:
+        return {"success": False, "error": "지원하지 않는 이미지 형식입니다. (jpg, png, gif, webp)"}
+
+    try:
+        image_bytes = await file.read()
+        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        text = await _call_claude([{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": file.content_type, "data": b64}},
+                {"type": "text", "text": "이 이미지에 있는 수학 문제를 텍스트로만 추출해주세요. 수식 기호는 그대로 유지하고, 문제 텍스트만 출력하세요. 설명 없이 문제만 출력하세요."}
+            ],
+        }], max_tokens=500)
+        return {"success": True, "problem": text}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        return {"success": False, "error": f"이미지 처리 오류: {str(e)}"}
