@@ -515,19 +515,25 @@ async def claude_solve_directly(problem: str) -> dict:
     if not CLAUDE_API_KEY:
         return {"success": False, "error": "Claude API 키가 설정되지 않았습니다."}
 
-    prompt = f"""다음 수학 문제를 중학생도 이해할 수 있도록 쉽고 친절하게 단계별로 풀어주세요.
+    prompt = f"""다음 수학 문제를 단계별로 정확하게 풀어주세요.
 
 문제: {problem}
+
+주의사항:
+- 풀이 과정과 최종 정답이 반드시 일치해야 합니다.
+- 풀이 도중 나온 값들을 합산할 때 중복 여부를 명확히 판단하고 일관되게 적용하세요.
+- 풀이 중간에 방향을 바꾸거나 자기모순적인 말을 하지 마세요.
+- 최종 ANSWER는 풀이의 마지막 계산 결과와 정확히 같아야 합니다.
 
 아래 형식으로 정확히 답하세요:
 
 PROBLEM_TYPE: (문제 유형, 예: 수열, 함수, 확률 등)
-ANSWER: (최종 정답)
+ANSWER: (최종 정답 - 풀이 결과와 반드시 일치)
 SOLUTION:
 (마크다운 형식으로 단계별 풀이. 수식은 인라인 $...$, 블록 $$...$$로 표시. 각 단계는 **굵게** 소제목으로 구분. 구체적인 숫자 계산 포함. 최소 5단계)
 EXPLANATION: (이 문제의 핵심 포인트 한 문장)"""
 
-    text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=1500)
+    text = await _call_claude([{"role": "user", "content": prompt}], max_tokens=2000)
     parsed = parse_structured(text)
     return {"success": True, **parsed}
 
