@@ -32,6 +32,7 @@ CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_INPUT_LENGTH = 2000
 SECRET_KEY = os.environ.get("SECRET_KEY", "mathsolver-secret-key-2024")
+WOLFRAM_APP_ID = os.environ.get("WOLFRAM_APP_ID", "")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 DB_PATH = "users.db"
@@ -252,6 +253,60 @@ EXPLANATION: (핵심 포인트 한 문장)"""
     return parse_structured(text)
 
 
+async def wolfram_solve(problem: str) -> dict:
+    if not WOLFRAM_APP_ID:
+        return {"success": False}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://api.wolframalpha.com/v2/query",
+                params={
+                    "appid": WOLFRAM_APP_ID,
+                    "input": problem,
+                    "output": "json",
+                    "format": "plaintext",
+                    "podstate": "Result__Step-by-step solution",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        if not data.get("queryresult", {}).get("success"):
+            return {"success": False}
+
+        pods = data["queryresult"].get("pods", [])
+        answer = ""
+        steps = []
+
+        for pod in pods:
+            title = pod.get("title", "")
+            plaintext = pod.get("subpods", [{}])[0].get("plaintext", "")
+            if not plaintext:
+                continue
+            if title in ("Result", "Exact result", "Value", "Solution", "Results"):
+                answer = plaintext
+            if title not in ("Input", "Input interpretation"):
+                steps.append(f"**{title}**\n{plaintext}")
+
+        if not answer and steps:
+            answer = steps[0].split("\n", 1)[-1].strip()
+
+        if not answer:
+            return {"success": False}
+
+        solution = "\n\n".join(steps)
+        return {
+            "success": True,
+            "problem_type": "Wolfram Alpha 계산",
+            "answer": answer,
+            "solution": solution,
+            "explanation": "Wolfram Alpha 엔진으로 계산된 결과입니다.",
+        }
+    except Exception:
+        return {"success": False}
+
+
 async def claude_solve_directly(problem: str) -> dict:
     if not CLAUDE_API_KEY:
         return {"success": False, "error": "Claude API 키가 설정되지 않았습니다."}
@@ -355,6 +410,19 @@ async def solve_problem(request: SolveRequest):
     sympy_result = sympy_solve(normalized, original)
 
     if not sympy_result["success"]:
+        # Wolfram Alpha 시도
+        wolfram_result = await wolfram_solve(original)
+        if wolfram_result["success"]:
+            return {
+                "success": True,
+                "problem_type": wolfram_result.get("problem_type", "수학 문제"),
+                "parsed_expression": original,
+                "answer": wolfram_result.get("answer", ""),
+                "solution": wolfram_result.get("solution", ""),
+                "explanation": wolfram_result.get("explanation", ""),
+                "verified": True,
+            }
+        # Claude 시도
         try:
             result = await claude_solve_directly(original)
             if result["success"]:
