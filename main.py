@@ -311,11 +311,14 @@ def extract_math_expression(problem: str) -> str:
                 d_idx = before.rfind(delimiter)
                 if d_idx != -1:
                     expr = before[d_idx + len(delimiter):].strip().lstrip(",").strip()
+                    # "다음 식" 등 앞의 한국어 설명 제거
+                    expr = re.sub(r'^[가-힣\s]+', '', expr).strip()
                     if expr:
                         return expr
             # 딜리미터 없으면 "= 0" 이후 부분
             if "= 0" in before:
                 expr = before.split("= 0", 1)[-1].strip().lstrip(",").strip()
+                expr = re.sub(r'^[가-힣\s]+', '', expr).strip()
                 if expr:
                     return expr
             return before
