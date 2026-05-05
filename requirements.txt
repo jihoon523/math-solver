@@ -3,3 +3,4 @@ uvicorn
 sympy
 httpx
 python-dotenv
+python-multipart
