@@ -4,3 +4,5 @@ sympy
 httpx
 python-dotenv
 python-multipart
+passlib[bcrypt]
+PyJWT
